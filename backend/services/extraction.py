@@ -1,6 +1,7 @@
 import json
 import os
 import google.generativeai as genai
+import groq
 from typing import Optional
 from backend.models import BidData
 
@@ -10,9 +11,10 @@ from dotenv import load_dotenv
 # Robustly load .env to ensure key is present even if main.py didn't load it
 def configure_genai():
     api_key = os.environ.get("GOOGLE_API_KEY")
+    groq_api_key = os.environ.get("GROQ_API_KEY")
     
-    if not api_key:
-        print("DEBUG: Key not found in env, attempting manual load...")
+    if not api_key or not groq_api_key:
+        print("DEBUG: API Key(s) not found in env, attempting manual load...")
         # Path from backend/services/extraction.py to my-agent/.env
         # .../backend/services/extraction.py -> services -> backend -> frontend
         base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -20,12 +22,18 @@ def configure_genai():
         print(f"DEBUG: Loading .env from {env_path}")
         load_dotenv(env_path)
         api_key = os.environ.get("GOOGLE_API_KEY")
+        groq_api_key = os.environ.get("GROQ_API_KEY")
 
     if not api_key:
-        print("CRITICAL: GOOGLE_API_KEY not found even after manual load.")
+        print("CRITICAL: GOOGLE_API_KEY not found.")
     else:
-        print(f"DEBUG: GOOGLE_API_KEY found (length {len(api_key)}). Configuring GenAI.")
+        print(f"DEBUG: GOOGLE_API_KEY found. Configuring GenAI.")
         genai.configure(api_key=api_key)
+        
+    if not groq_api_key:
+        print("CRITICAL: GROQ_API_KEY not found.")
+    else:
+        print(f"DEBUG: GROQ_API_KEY found.")
 
 def extract_bid_data(text: str) -> BidData:
     """
@@ -139,37 +147,65 @@ def extract_bid_data(text: str) -> BidData:
         try_models = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-flash-latest']
         
         response = None
+        response_text = None
         last_error = None
         import time
 
-        for model_name in try_models:
-            retries = 3
-            for attempt in range(retries):
-                try:
-                    print(f"Attempting with {model_name} (Try {attempt+1}/{retries})")
-                    model = genai.GenerativeModel(model_name)
-                    response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
-                    if response:
-                        break # Success
-                except Exception as e:
-                    print(f"Failed with {model_name}: {e}")
-                    last_error = e
-                    if "429" in str(e) or "quota" in str(e).lower():
-                        wait_time = 10 * (attempt + 1) # 10s, 20s, 30s
-                        print(f"Rate limit hit. Waiting {wait_time}s...")
-                        time.sleep(wait_time) # Backoff
-                    else:
-                        break # Move to next model if not a rate limit issue (e.g. invalid key)
-            
-            if response:
-                break # Exit model loop if success
+        if os.environ.get("GOOGLE_API_KEY"):
+            for model_name in try_models:
+                retries = 2
+                for attempt in range(retries):
+                    try:
+                        print(f"Attempting with {model_name} (Try {attempt+1}/{retries})")
+                        model = genai.GenerativeModel(model_name)
+                        response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
+                        if response:
+                            response_text = response.text
+                            break # Success
+                    except Exception as e:
+                        print(f"Failed with {model_name}: {e}")
+                        last_error = e
+                        if "429" in str(e) or "quota" in str(e).lower():
+                            if os.environ.get("GROQ_API_KEY"):
+                                print("Google quota/rate limit hit. Skipping to Groq immediately.")
+                                break # break inner loop
+                            else:
+                                wait_time = 2 * (attempt + 1)
+                                print(f"Rate limit hit. Waiting {wait_time}s...")
+                                time.sleep(wait_time) # Backoff
+                        else:
+                            break # Move to next model if not a rate limit issue (e.g. invalid key)
+                
+                if response_text:
+                    break # Exit outer model loop if success
+                    
+                if last_error and ("429" in str(last_error) or "quota" in str(last_error).lower()) and os.environ.get("GROQ_API_KEY"):
+                    break # Exit outer model loop to immediately go to Groq
 
-        if not response:
+        # Fallback to Groq if Google failed or key is missing
+        if not response_text and os.environ.get("GROQ_API_KEY"):
+            print("Falling back to Groq API...")
+            try:
+                client = groq.Groq(api_key=os.environ.get("GROQ_API_KEY"))
+                completion = client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ],
+                    response_format={"type": "json_object"}
+                )
+                response_text = completion.choices[0].message.content
+                print("Groq API successfully generated content.")
+            except Exception as e:
+                print(f"Groq API fallback failed: {e}")
+                last_error = e
+
+        if not response_text:
             raise last_error or Exception("All models failed")
 
         # Parse JSON
-        print(f"DEBUG: Raw LLM Response: {response.text}") # LOG RAW RESPONSE
-        clean_text = response.text.replace("```json", "").replace("```", "").strip()
+        print(f"DEBUG: Raw LLM Response: {response_text}") # LOG RAW RESPONSE
+        clean_text = response_text.replace("```json", "").replace("```", "").strip()
         
         try:
             data_dict = json.loads(clean_text)

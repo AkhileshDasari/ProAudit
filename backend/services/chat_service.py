@@ -43,21 +43,50 @@ def chat_with_ai(message: str, history: list) -> str:
     last_error = None
     import time
 
-    for model_name in try_models:
+    if os.environ.get("GOOGLE_API_KEY"):
+        for model_name in try_models:
+            try:
+                print(f"DEBUG: Chat attempting with {model_name}...")
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(chat_context)
+                if response:
+                    response_text = response.text.strip()
+                    break # Success
+            except Exception as e:
+                print(f"DEBUG: Chat Failed with {model_name}: {e}")
+                last_error = e
+                if "429" in str(e) or "quota" in str(e).lower():
+                    if os.environ.get("GROQ_API_KEY"):
+                        print("DEBUG: Google quota hit. Skipping to Groq immediately.")
+                        break
+                    else:
+                        time.sleep(2) # Brief backoff
+                else:
+                    break # Try next model or fallback
+                    
+    # Fallback to Groq if Google failed or key is missing
+    if not response_text and os.environ.get("GROQ_API_KEY"):
+        print("DEBUG: Chat falling back to Groq API...")
         try:
-            print(f"DEBUG: Chat attempting with {model_name}...")
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(chat_context)
-            if response:
-                response_text = response.text.strip()
-                break # Success
+            import groq
+            client = groq.Groq(api_key=os.environ.get("GROQ_API_KEY"))
+            
+            # Format history for Groq
+            messages = [{"role": "system", "content": system_instruction}]
+            for msg in history[-5:]:
+                role = "user" if msg.get("sender") == "user" else "assistant"
+                messages.append({"role": role, "content": msg.get("text", "")})
+            messages.append({"role": "user", "content": message})
+            
+            completion = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages
+            )
+            response_text = completion.choices[0].message.content.strip()
+            print("DEBUG: Groq chat successfully generated.")
         except Exception as e:
-            print(f"DEBUG: Chat Failed with {model_name}: {e}")
+            print(f"DEBUG: Groq Chat fallback failed: {e}")
             last_error = e
-            if "429" in str(e) or "quota" in str(e).lower():
-                time.sleep(2) # Brief backoff
-            else:
-                continue # Try next model
     
     if response_text:
         return response_text
